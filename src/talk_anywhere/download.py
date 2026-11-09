@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from pathlib import Path
 
 from talk_anywhere.models import directory, ensure_processor, get_model, model_ready
@@ -50,37 +51,53 @@ def download(model_key: str = "pro") -> None:
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
+    patterns = (
+        [
+            "model.safetensors",
+            "config.json",
+            "processor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "NOTICE",
+            "LICENSE",
+        ]
+        if spec.kind == "safetensors"
+        else ["model.bark", "bark_loader.py", "NOTICE", "LICENSE"]
+    )
+    last_error = "Download failed."
     try:
         from huggingface_hub import snapshot_download
 
-        if spec.kind == "safetensors":
-            patterns = [
-                "model.safetensors",
-                "config.json",
-                *tuple(name for name in (
-                    "processor_config.json",
-                    "tokenizer.json",
-                    "tokenizer_config.json",
-                    "generation_config.json",
-                )),
-                "NOTICE",
-                "LICENSE",
-            ]
-        else:
-            patterns = ["model.bark", "bark_loader.py", "NOTICE", "LICENSE"]
-        snapshot_download(
-            repo_id=spec.repo,
-            local_dir=str(folder),
-            allow_patterns=patterns,
-        )
-        if spec.kind == "bark":
-            ensure_processor()
-    except Exception as exc:
-        emit({"event": "error", "message": f"Could not download {spec.title}. {exc}"})
-        return
+        for attempt in range(1, 4):
+            try:
+                snapshot_download(
+                    repo_id=spec.repo,
+                    local_dir=str(folder),
+                    allow_patterns=patterns,
+                )
+                if spec.kind == "bark":
+                    ensure_processor()
+                last_error = ""
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt < 3:
+                    emit(
+                        {
+                            "event": "retrying",
+                            "attempt": attempt,
+                            "message": f"Download hit a problem. Retrying ({attempt}/3). {exc}",
+                        }
+                    )
+                    time.sleep(2)
     finally:
         stop.set()
         watcher.join(timeout=1)
+
+    if last_error:
+        emit({"event": "error", "message": f"Could not download {spec.title}. {last_error}"})
+        return
 
     if not model_ready(spec):
         emit(

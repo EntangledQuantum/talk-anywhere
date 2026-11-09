@@ -111,6 +111,36 @@ def model_ready(spec: BarkModel | None = None) -> bool:
     return _files_ready(processor_source(spec), PROCESSOR_FILES)
 
 
+def format_bytes(size: int) -> str:
+    if size >= 1_000_000_000:
+        return f"{size / 1_000_000_000:.2f} GB"
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.0f} MB"
+    return f"{size / 1000:.0f} KB"
+
+
+def remove_model(spec: BarkModel) -> None:
+    """Delete one downloaded model. Other models keep the small shared tokenizer."""
+    folder = directory(spec)
+    if spec.kind == "safetensors":
+        others = [
+            other
+            for other in MODELS
+            if other.kind == "bark" and (directory(other) / other.weights_name).is_file()
+        ]
+        if others:
+            try:
+                ensure_processor()
+            except Exception:
+                pass
+    if folder.is_dir():
+        shutil.rmtree(folder)
+    if not any((directory(item) / item.weights_name).is_file() for item in MODELS):
+        shared = processor_dir()
+        if shared.is_dir():
+            shutil.rmtree(shared)
+
+
 def ensure_processor() -> Path:
     """Copy or download the small tokenizer files. Never downloads Pro's weights."""
     dest = processor_dir()

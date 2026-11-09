@@ -23,7 +23,14 @@ from talk_anywhere.icons import ensure_icons
 from talk_anywhere.inject import InjectError, assert_foreign_focus, backspace, type_text
 from talk_anywhere.install_desktop import install_autostart
 from talk_anywhere.mics import MicError, list_mics, resolve_mic
-from talk_anywhere.models import directory, get_model, model_ready, processor_source
+from talk_anywhere.models import (
+    directory,
+    format_bytes,
+    get_model,
+    model_ready,
+    processor_source,
+    remove_model,
+)
 from talk_anywhere.paths import ENGINE_PYTHON, ROOT, log_path
 from talk_anywhere.sounds import PAIRS, ensure_sounds, play
 from talk_anywhere.shortcut import (
@@ -135,6 +142,13 @@ class TalkApp:
         self.loading_models = False
         self.loading_sounds = False
         self.downloading = False
+        self.download_paused = False
+        self.download_proc: subprocess.Popen | None = None
+        self.download_key = ""
+        self.download_error = ""
+        self.download_done = 0
+        self.download_total = 0
+        self.suppress_engine_exit = False
         self.state = "starting"
         self.error = ""
         self.stderr_tail = ""
@@ -248,11 +262,23 @@ class TalkApp:
         self.progress.set_no_show_all(True)
         grid.attach(self.progress, 0, 8, 3, 1)
 
+        self.model_actions = Gtk.Box(spacing=8)
         self.download_button = Gtk.Button(label="Download model")
         self.download_button.get_style_context().add_class("suggested-action")
         self.download_button.connect("clicked", lambda _b: self._start_download())
         self.download_button.set_no_show_all(True)
-        grid.attach(self.download_button, 0, 9, 3, 1)
+        self.pause_button = Gtk.Button(label="Pause")
+        self.pause_button.connect("clicked", lambda _b: self._toggle_pause())
+        self.pause_button.set_no_show_all(True)
+        self.retry_button = Gtk.Button(label="Retry")
+        self.retry_button.connect("clicked", lambda _b: self._retry_download())
+        self.retry_button.set_no_show_all(True)
+        self.delete_button = Gtk.Button(label="Delete")
+        self.delete_button.connect("clicked", lambda _b: self._delete_model())
+        self.delete_button.set_no_show_all(True)
+        for button in (self.download_button, self.pause_button, self.retry_button, self.delete_button):
+            self.model_actions.pack_start(button, False, False, 0)
+        grid.attach(self.model_actions, 0, 9, 3, 1)
 
         grid.attach(self._label("Sounds"), 0, 10, 1, 1)
         self.sound_store = Gtk.ListStore(str, str)
@@ -458,26 +484,36 @@ class TalkApp:
         if not ENGINE_PYTHON.is_file():
             self.set_error(f"The speech engine is not installed at {ENGINE_PYTHON}.")
             return
-        self.downloading = True
-        self.download_button.set_sensitive(False)
-        self.progress.show()
-        self.progress.set_fraction(0)
-        self.progress.set_text("Starting download")
-        threading.Thread(target=self._download_thread, daemon=True).start()
-
-    def _download_thread(self) -> None:
+        key = self.config.model_key
         try:
             proc = subprocess.Popen(
-                [str(ENGINE_PYTHON), "-u", "-m", "talk_anywhere.download", self.config.model_key],
+                [str(ENGINE_PYTHON), "-u", "-m", "talk_anywhere.download", key],
                 cwd=str(ROOT),
                 env=_engine_env(offline=False),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                start_new_session=True,
             )
         except OSError as exc:
-            GLib.idle_add(self._download_finished, f"Could not start the download. {exc}")
+            self.download_error = f"Could not start the download. {exc}"
+            self._update_visuals()
             return
+        self.download_proc = proc
+        self.download_key = key
+        self.downloading = True
+        self.download_paused = False
+        self.download_error = ""
+        self.download_done = 0
+        self.download_total = get_model(key).weights_bytes
+        self.clear_error()
+        self.progress.show()
+        self.progress.set_fraction(0)
+        self.progress.set_text("Starting download")
+        self._update_visuals()
+        threading.Thread(target=self._read_download, args=(proc, key), daemon=True).start()
+
+    def _read_download(self, proc: subprocess.Popen, key: str) -> None:
         assert proc.stdout is not None
         error = ""
         for line in proc.stdout:
@@ -489,42 +525,174 @@ class TalkApp:
             except json.JSONDecodeError:
                 log.info("download: %s", line)
                 continue
-            if event.get("event") == "progress":
-                GLib.idle_add(self._download_progress, event.get("bytes") or 0, event.get("total") or 0)
-            elif event.get("event") == "error":
-                error = event.get("message") or "Download failed."
-            elif event.get("event") == "done":
+            kind = event.get("event")
+            if kind == "progress":
+                GLib.idle_add(
+                    self._download_progress,
+                    key,
+                    int(event.get("bytes") or 0),
+                    int(event.get("total") or 0),
+                )
+            elif kind == "retrying":
+                GLib.idle_add(self._download_retrying, key, str(event.get("message") or ""))
+            elif kind == "error":
+                error = str(event.get("message") or "Download failed.")
+            elif kind == "done":
                 error = ""
         code = proc.wait()
-        if code != 0 and not error:
+        if code not in (0, -15) and not error:
             error = f"Download exited with status {code}."
-        GLib.idle_add(self._download_finished, error)
+        GLib.idle_add(self._download_finished, proc, key, error)
 
-    def _download_progress(self, done: int, total: int) -> bool:
+    def _download_progress(self, key: str, done: int, total: int) -> bool:
+        if key != self.download_key:
+            return False
+        self.download_done = done
+        self.download_total = total or self.download_total
+        if self.config.model_key != key:
+            return False
+        if self.download_paused:
+            self.progress.set_text(f"Paused at {_progress_label(done, total)}")
+            return False
         if total <= 0:
             self.progress.pulse()
-            self.progress.set_text(f"Downloading {get_model(self.config.model_key).title}")
-        else:
-            fraction = max(0.0, min(1.0, done / total))
-            self.progress.set_fraction(fraction)
-            self.progress.set_text(f"{fraction * 100:.0f}%")
+            self.progress.set_text(f"Downloading {get_model(key).title}")
+            return False
+        fraction = max(0.0, min(1.0, done / total))
+        self.progress.set_fraction(fraction)
+        self.progress.set_text(_progress_label(done, total))
         return False
 
-    def _download_finished(self, error: str) -> bool:
-        self.downloading = False
-        self.download_button.set_sensitive(True)
-        if error:
-            self.set_error(error)
+    def _download_retrying(self, key: str, message: str) -> bool:
+        if key != self.download_key or self.config.model_key != key:
             return False
-        if not model_ready(get_model(self.config.model_key)):
-            title = get_model(self.config.model_key).title
-            self.set_error(f"{title} is still incomplete after the download.")
-            return False
-        self.clear_error()
-        self.state = "loading"
-        self._update_visuals()
-        self._spawn_engine()
+        self.progress.set_text(message)
+        self.model_label.set_text(message)
         return False
+
+    def _download_finished(self, proc: subprocess.Popen, key: str, error: str) -> bool:
+        if self.download_proc is not proc:
+            return False
+        self.downloading = False
+        self.download_paused = False
+        self.download_proc = None
+        if self.quitting:
+            return False
+        if error:
+            self.download_error = error
+            if self.config.model_key == key:
+                self._update_visuals()
+            return False
+        if not model_ready(get_model(key)):
+            self.download_error = f"{get_model(key).title} is still incomplete. Retry continues the download."
+            if self.config.model_key == key:
+                self._update_visuals()
+            return False
+        self.download_error = ""
+        self.clear_error()
+        if self.config.model_key == key:
+            self.state = "loading"
+            self._update_visuals()
+            self._spawn_engine()
+        return False
+
+    def _toggle_pause(self) -> None:
+        proc = self.download_proc
+        if proc is None or proc.poll() is not None or self.download_key != self.config.model_key:
+            return
+        try:
+            if self.download_paused:
+                os.kill(proc.pid, signal.SIGCONT)
+                self.download_paused = False
+            else:
+                os.kill(proc.pid, signal.SIGSTOP)
+                self.download_paused = True
+                self.progress.set_text(f"Paused at {_progress_label(self.download_done, self.download_total)}")
+        except OSError as exc:
+            self.download_error = f"Could not pause the download. {exc}"
+        self._update_visuals()
+
+    def _retry_download(self) -> None:
+        self._halt_download()
+        self.download_error = ""
+        self.clear_error()
+        self._start_download()
+
+    def _halt_download(self) -> None:
+        proc = self.download_proc
+        self.download_proc = None
+        self.downloading = False
+        self.download_paused = False
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.kill(proc.pid, signal.SIGCONT)
+        except OSError:
+            pass
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    def _delete_model(self) -> None:
+        spec = get_model(self.config.model_key)
+        if not model_ready(spec):
+            return
+        dialog = Gtk.MessageDialog(
+            parent=self.window,
+            flags=Gtk.DialogFlags.MODAL,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Delete {spec.title}?",
+        )
+        dialog.format_secondary_text(
+            f"This removes the files and frees {format_bytes(spec.weights_bytes)}. You can download it again later."
+        )
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Delete", Gtk.ResponseType.OK)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        if self.listening or self.state == "opening-mic":
+            self._send({"cmd": "stop"})
+            self.listening = False
+            self.accept_text = False
+        self._release_engine()
+        try:
+            remove_model(spec)
+        except OSError as exc:
+            self.set_error(f"Could not delete {spec.title}. {exc}")
+            return
+        self.download_error = ""
+        self.download_done = 0
+        self.clear_error()
+        self.gpu_name = ""
+        self.state = "needs-model"
+        self._update_visuals()
+
+    def _release_engine(self) -> None:
+        proc = self.proc
+        self.proc = None
+        self.model_loaded = False
+        if proc is None or proc.poll() is not None:
+            return
+        self.suppress_engine_exit = True
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                proc.stdin.flush()
+        except OSError:
+            proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def _load_command(self) -> dict:
         spec = get_model(self.config.model_key)
@@ -600,6 +768,11 @@ class TalkApp:
         GLib.idle_add(self._engine_exited, proc, code)
 
     def _engine_exited(self, proc: subprocess.Popen, code: int) -> bool:
+        if self.suppress_engine_exit:
+            self.suppress_engine_exit = False
+            if self.proc is proc:
+                self.proc = None
+            return False
         if self.proc is not proc:
             return False
         self.proc = None
@@ -809,16 +982,37 @@ class TalkApp:
         if not self.capturing:
             self.shortcut_button.set_label("Change")
         ready = model_ready(spec)
+        same_download = self.downloading and self.download_key == spec.key
+        failed = bool(self.download_error) and self.download_key == spec.key and not ready
+        self.download_button.hide()
+        self.pause_button.hide()
+        self.retry_button.hide()
+        self.delete_button.hide()
         if ready:
-            self.model_label.set_text(f"{spec.title} is downloaded. {spec.summary}.")
-            self.download_button.hide()
+            self.model_label.set_text(f"{spec.title} is downloaded. {format_bytes(spec.weights_bytes)}.")
             self.progress.hide()
+            self.delete_button.set_label(f"Delete {spec.title}")
+            self.delete_button.show()
         else:
-            self.model_label.set_text(f"{spec.title} is not downloaded yet. {spec.summary}.")
-            self.download_button.set_label(f"Download {spec.title}")
-            self.download_button.show()
-            if self.downloading:
+            if same_download and self.download_paused:
+                self.model_label.set_text(f"{spec.title} download is paused.")
+                self.pause_button.set_label("Resume")
+                self.pause_button.show()
                 self.progress.show()
+            elif same_download:
+                self.model_label.set_text(f"Downloading {spec.title}. {spec.summary}.")
+                self.pause_button.set_label("Pause")
+                self.pause_button.show()
+                self.progress.show()
+            elif failed:
+                self.model_label.set_text(self.download_error)
+                self.retry_button.show()
+                self.progress.show()
+            else:
+                self.model_label.set_text(f"{spec.title} is not downloaded yet. {spec.summary}.")
+                self.download_button.set_label(f"Download {spec.title}")
+                self.download_button.show()
+                self.progress.hide()
         self.gpu_label.set_text(self.gpu_name or "GPU not loaded yet")
         self.hint.set_text(
             f"Click a text field, then press {shortcut}. "
@@ -929,6 +1123,7 @@ class TalkApp:
             return False
         self.quitting = True
         self.accept_text = False
+        self._halt_download()
         try:
             if self.proc is not None and self.proc.poll() is None and self.proc.stdin is not None:
                 self.proc.stdin.write(json.dumps({"cmd": "shutdown"}) + "\n")
@@ -940,6 +1135,13 @@ class TalkApp:
             self.server.close()
         Gtk.main_quit()
         return False
+
+
+def _progress_label(done: int, total: int) -> str:
+    if total <= 0:
+        return format_bytes(done)
+    fraction = max(0.0, min(1.0, done / total))
+    return f"{fraction * 100:.0f}%  ·  {format_bytes(done)} of {format_bytes(total)}"
 
 
 def _launcher() -> str:
