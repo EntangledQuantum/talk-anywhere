@@ -1,0 +1,25 @@
+[project]
+name = "talk-anywhere"
+version = "1.0.0"
+description = "Toggle English dictation into any focused text field. Uses Underdog Bark 3.0 Pro."
+requires-python = ">=3.12"
+dependencies = [
+    "torch==2.8.0",
+    "transformers==5.19.0",
+    "numpy==2.4.6",
+    "librosa==0.11.0",
+    "soundfile==0.14.0",
+    "soxr==1.1.0",
+    "huggingface_hub>=0.26",
+    "constriction>=0.5.0",
+]
+
+[project.scripts]
+talk-anywhere = "talk_anywhere.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
